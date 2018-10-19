@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+
+'''
+A tool to manage MFA session creation, allowing the settings to be saved to a
+configuration file and providing a set of commands to run to utilise the
+created session.
+
+Usage:
+    aws-mfa login [--duration=<time>] <mfa_token>
+    aws-mfa set-mfa-arn <mfa_arn>
+
+Arguments:
+    login                            Create an AWS session with a MFA token
+    set-mfa-arn                      Configure an ARN to use as the MFA device
+    --duration=<time>, -d <time>     How long to create the session for
+                                     [default: 43200]
+'''
+
+
+import os
+import sys
+
+import boto3
+import docopt
+import jsonschema
+import textwrap
+import yaml
+
+
+CONFIG_FILE = os.path.join(
+    os.path.expanduser('~'), '.aws-mfa-login'
+)
+DEFAULT_CONFIG = {
+    'mfa_arn': ''
+}
+
+CONFIG_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'mfa_arn': {'type': 'string'}
+    }
+}
+
+
+def get_config():
+    conf = None
+
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as conf_f:
+            conf = yaml.safe_load(conf_f)
+
+    if not conf:
+        conf = DEFAULT_CONFIG
+
+    jsonschema.validate(conf, CONFIG_SCHEMA)
+
+    return conf
+
+
+def store_config(conf):
+    jsonschema.validate(conf, CONFIG_SCHEMA)
+
+    with open(CONFIG_FILE, 'w') as conf_f:
+        yaml.dump(conf, conf_f)
+
+
+def set_mfa_arn(arn):
+    conf = get_config()
+    conf['mfa_arn'] = arn
+    store_config(conf)
+
+
+def get_mfa_arn():
+    conf = get_config()
+
+    return conf['mfa_arn']
+
+
+def ensure_mfa_arn():
+        mfa = get_mfa_arn()
+
+        if mfa:
+            return mfa
+
+        mfa_arn = input('What is your MFA ARN?: ')
+        set_mfa_arn(mfa_arn)
+
+        return mfa_arn
+
+
+def get_session_keys(mfa_arn, mfa_token, duration):
+    aws_client = boto3.client('sts')
+    return aws_client.get_session_token(
+        DurationSeconds=duration,
+        SerialNumber=mfa_arn,
+        TokenCode=mfa_token
+    )
+
+
+def get_exports(keys):
+    creds = keys['Credentials']
+    access_key_id = creds['AccessKeyId']
+    secret_access_key = creds['SecretAccessKey']
+    session_token = creds['SessionToken']
+    expiration = creds['Expiration']
+
+    print(textwrap.dedent('''
+        Paste the following into your terminal:
+
+            export AWS_ACCESS_KEY_ID="{access}"
+            export AWS_SECRET_ACCESS_KEY="{secret}"
+            export AWS_SESSION_TOKEN="{token}"
+
+        These credentials will expire at {expire}.
+    '''.format(
+            access=access_key_id,
+            secret=secret_access_key,
+            token=session_token,
+            expire=expiration
+        )
+    ))
+
+
+def main(args):
+    if args.get('set-mfa-arn'):
+        set_mfa_arn(args.get('<mfa_arn>'))
+        print('Set MFA ARN to {}'.format(get_config()['mfa_arn']))
+
+    if args.get('login'):
+        mfa_arn = ensure_mfa_arn()
+        mfa_token = args.get('<mfa_token>')
+        duration = int(args.get('--duration'))
+
+        keys = get_session_keys(mfa_arn, mfa_token, duration)
+        get_exports(keys)
+
+
+if __name__ == '__main__':
+    ARGS = docopt.docopt(__doc__)
+    sys.exit(main(ARGS))
