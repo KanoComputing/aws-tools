@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+
+
+'''
+A tool to find a minimal permission set
+
+Usage:
+    aws-policy-minimize [options] <testscript> <maxperm.json> <policyARN> -o <minperm.json>
+
+Options:
+    --verbose,-v                      Print trials
+    --sleeptime SLEEP, -s SLEEP       sleep time  [default: 30]
+
+Arguments:
+    testscript             A script which needs the permissions
+    maxperm.json           An aws policy json. Note that statement IDs must be unique
+    policyARN              ARN to load the test policy into. 
+    minperm.json           Where to write the minimal policy locally.
+
+
+Environment variables:
+
+    AWS_ACCESS_KEY_ID      Will be used for SETTING the permissions
+    AWS_SECRET_ACCESS_KEY   ..
+    AWS_SESSION_TOKEN       ..
+
+    TEST_AWS_ACCESS_KEY_ID      If set, we are going to pass these as
+    TEST_AWS_SECRET_ACCESS_KEY   aws credentials to the test script
+    TEST_AWS_SESSION_TOKEN       Ie, for USING the permissions
+
+
+'''
+
+
+import boto3
+import docopt
+import json
+import sys
+import itertools
+import picire
+import os
+import subprocess
+import time
+
+
+
+class UnsupportedEffect(Exception):
+    def __init__(self, effect):
+        self.effect = effect
+
+    def __str__(self):
+        return "unsupported effect %s" % (self.effect)
+
+
+def elimSingleton(items):
+    if type(items) != list:
+        return [items]
+    return items
+
+def makeSingleton(items):
+    if len(items)==1:
+        return items[0]
+    return items
+    
+
+class AWSPolicyStatement:
+    def __init__(self, jsonFrag):
+        if jsonFrag['Effect'] != 'Allow':
+            raise UnsupportedEffect(jsonFrag['Effect'])
+
+        self.origJson = jsonFrag
+
+        self.actions = elimSingleton(jsonFrag['Action'])
+        self.resources = elimSingleton(jsonFrag['Resource'])
+        self.idStr = jsonFrag['Sid']
+
+    def _actionId(self,action):
+        return "%s/action/%s" % (self.idStr, action)
+
+    def _resourceId(self,resource):
+        return "%s/resource/%s" % (self.idStr, resource)
+
+    def statementPartIDs(self):
+        return [self._actionId(a) for a in self.actions] + [self._resourceId(r) for r in self.resources]
+
+    def makeStatementSubset(self, statementPartIDs):
+        res = self.origJson.copy()
+        actions = [a for a in self.actions if self._actionId(a) in statementPartIDs]
+        if not len(actions):
+            return None
+
+        resources = [r for r in self.resources if self._resourceId(r) in statementPartIDs]
+        if not len(resources):
+            return None
+
+        res['Action'] = actions
+        res['Resource'] = resources
+        return res
+        
+
+class AWSPolicyGen:
+    """
+    This class parses a policy json file, and allows us to generate subsets of it.
+
+    """
+    def __init__(self, policyFile):
+        self.policyFile = json.loads(open(policyFile, 'r').read())
+        self.statements = [AWSPolicyStatement(s) for s in
+                           self.policyFile['Statement']]
+        self.configIDs = list(itertools.chain(*[x.statementPartIDs() for x in
+                                               self.statements]))
+        
+
+    def policyPartIDs(self):
+        """
+        Return a list of identifiers for things that can be removed from the policy
+        """
+        return self.configIDs
+        
+    def makePolicySubset(self, statementPartIDs):
+        """
+        Based on a subset of the policy identifiers, 
+        """
+        res = self.policyFile.copy()
+
+        statements = []
+        for s in self.statements:
+            smod = s.makeStatementSubset(statementPartIDs)
+            if smod:
+                statements.append(smod)
+        res['Statement'] = statements
+        return res
+
+class AWSPolicyTester():
+    """
+    Integration class. picire wants a test function,
+    but can't pass it any arguments, so we collect everything we need in this
+    class, but avoid doing much logic here.
+    """
+    
+    def __init__(self, policyGen, policyLoader, scriptRunner, verbose):
+        self.scriptRunner = scriptRunner
+        self.policyLoader = policyLoader
+        self.verbose = verbose
+        self.policyGen = policyGen
+
+    def test(self, policyPartIDs, config_ID):
+        if self.verbose:
+            print("Trying: ",policyPartIDs)
+        policy = self.policyGen.makePolicySubset(policyPartIDs)
+
+        # a policy needs at least one statement
+        if policy['Statement'] ==[]:
+            return picire.AbstractDD.PASS
+
+
+        self.policyLoader.load(policy)
+
+        retval = self.scriptRunner.run()
+
+
+        # picire looks for the minimal 'failing' config.
+        # but we want to look for the minimum successful config
+        # so we need to invert the return value
+        if retval == 0:
+            if self.verbose:
+                print("Succeeded\n")
+            return picire.AbstractDD.FAIL
+        if self.verbose:
+            print("Failed")
+        return picire.AbstractDD.PASS
+
+class PolicyLoader:
+    """
+    class to load a policy into a particilar policy ARN in AWS
+    Currently assumes the policy already exists, and we want to overwrite it.
+    We can only create versions of a policy, so we need to potentially
+    delete a version (if we have too many)
+    """
+
+    aws_max_policies = 5
+
+    def __init__(self, arn, sleepTime):
+        self.arn = arn
+        self.sleepTime = sleepTime
+        iam = boto3.resource('iam')
+        self.policy = iam.Policy(self.arn)
+
+    def load(self, policy):
+        # FIXME more error handling 
+        versions = [v for v in self.policy.versions.all()]
+        versions.sort(key=lambda x: x.version_id)
+
+        if len(versions) >= self.aws_max_policies:
+            if versions[0].is_default_version:
+                versions[1].delete()
+            else:
+                versions[0].delete()
+
+        policy_version = self.policy.create_version(PolicyDocument = json.dumps(policy),
+                                                    SetAsDefault=True)
+        time.sleep(self.sleepTime)
+
+
+class ScriptRunner:
+    """
+    Run the test script, and pass any environment variables
+    """
+
+    copyVars = ["AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","AWS_SESSION_TOKEN"]
+    
+    def __init__(self, testScript):
+        self.testScript = testScript
+        self.environ = os.environ.copy()
+        for var in self.copyVars:
+            testVar = 'TEST_'+var
+            if testVar in self.environ:
+                self.environ[var] = self.environ[testVar]
+
+    def run(self):
+        return subprocess.run([self.testScript], env=self.environ).returncode
+
+
+def main(args):
+    testScript = args.get('<testscript>')
+    maxPerm = args.get('<maxperm.json>')
+    policyARN = args.get('<policyARN>')
+    minPerm = args.get('<minperm.json>')
+    minPermFile = open(minPerm, 'w') # open at the start to fail early
+
+    sleepTime = int(args.get('--sleeptime'))
+
+    policyLoader = PolicyLoader(policyARN, sleepTime)
+    scriptRunner = ScriptRunner(testScript)
+    
+    try:
+        policyGen = AWSPolicyGen(maxPerm)
+        policyTester = AWSPolicyTester(policyGen, policyLoader, scriptRunner, args['--verbose'])
+    except Exception as e:
+        print("Unable to load policy file", e)
+        sys.exit(1)
+
+    policyPartIDs = policyGen.policyPartIDs()
+
+    dd = picire.LightDD(test=policyTester.test)
+
+    minConfig = dd.ddmin(policyPartIDs)
+
+    minConfigStr = json.dumps(policyGen.makePolicySubset(minConfig))
+    minPermFile.write(minConfigStr)
+    minPermFile.close()
+    
+    
+
+if __name__ == '__main__':
+    ARGS = docopt.docopt(__doc__)
+    sys.exit(main(ARGS))
+
+
