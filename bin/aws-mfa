@@ -6,8 +6,8 @@ configuration file and providing a set of commands to run to utilise the
 created session.
 
 Usage:
-    aws-mfa login [--duration=<time>] <mfa_token>
-    aws-mfa set-mfa-arn <mfa_arn>
+    aws-mfa [--profile <profile>] login [--duration=<time>] <mfa_token>
+    aws-mfa [--profile <profile>] set-mfa-arn <mfa_arn>
 
 Arguments:
     login                            Create an AWS session with a MFA token
@@ -31,108 +31,142 @@ CONFIG_FILE = os.path.join(
     os.path.expanduser('~'), '.aws-mfa-login'
 )
 DEFAULT_CONFIG = {
-    'mfa_arn': ''
+    'mfa_arn': '',
+    'profiles': {}
 }
 
 CONFIG_SCHEMA = {
+    'definitions': {
+      'account':  {
+        'type': 'object',
+        'properties': {
+            'mfa_arn': {'type': 'string'}
+        }
+      }
+    },
     'type': 'object',
     'properties': {
-        'mfa_arn': {'type': 'string'}
-    }
+        'mfa_arn': {'type': 'string'}, # default mfa
+        'profiles' : {
+           'type': 'object',
+           'additionalProperties': { "$ref": "#/definitions/account" }
+        }
+   }
 }
 
+class AccountManager:
+    def __init__(self, profile):
+        self.profile = profile
 
-def get_config():
-    conf = None
+    def get_config(self):
+        conf = None
 
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as conf_f:
-            conf = yaml.safe_load(conf_f)
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as conf_f:
+                conf = yaml.safe_load(conf_f)
 
-    if not conf:
-        conf = DEFAULT_CONFIG
+        if not conf:
+            conf = DEFAULT_CONFIG
 
-    jsonschema.validate(conf, CONFIG_SCHEMA)
+        jsonschema.validate(conf, CONFIG_SCHEMA)
 
-    return conf
-
-
-def store_config(conf):
-    jsonschema.validate(conf, CONFIG_SCHEMA)
-
-    with open(CONFIG_FILE, 'w') as conf_f:
-        yaml.dump(conf, conf_f)
+        return conf
 
 
-def set_mfa_arn(arn):
-    conf = get_config()
-    conf['mfa_arn'] = arn
-    store_config(conf)
+    def store_config(self, conf):
+        jsonschema.validate(conf, CONFIG_SCHEMA)
+
+        with open(CONFIG_FILE, 'w') as conf_f:
+            yaml.dump(conf, conf_f)
 
 
-def get_mfa_arn():
-    conf = get_config()
-
-    return conf['mfa_arn']
-
-
-def ensure_mfa_arn():
-        mfa = get_mfa_arn()
-
-        if mfa:
-            return mfa
-
-        mfa_arn = input('What is your MFA ARN?: ')
-        set_mfa_arn(mfa_arn)
-
-        return mfa_arn
+    def set_mfa_arn(self, arn):
+        conf = self.get_config()
+        if self.profile != 'default':
+            if not 'profiles'  in conf:
+                conf['profiles'] = {}
+            if self.profile not in conf['profiles']:
+                conf['profiles'][self.profile] = {}
+            conf['profiles'][self.profile]['mfa_arn'] = arn
+        else:
+            conf['mfa_arn'] = arn
+        self.store_config(conf)
 
 
-def get_session_keys(mfa_arn, mfa_token, duration):
-    aws_client = boto3.client('sts')
-    return aws_client.get_session_token(
-        DurationSeconds=duration,
-        SerialNumber=mfa_arn,
-        TokenCode=mfa_token
-    )
+    def get_mfa_arn(self):
+        conf = self.get_config()
+        if self.profile != 'default':
+            if self.profile in conf['profiles']:
+                return conf['profiles'][self.profile]['mfa_arn']
+            else:
+                print('missing ARN for profile ', self.profile)
+        return conf['mfa_arn']
 
 
-def get_exports(keys):
-    creds = keys['Credentials']
-    access_key_id = creds['AccessKeyId']
-    secret_access_key = creds['SecretAccessKey']
-    session_token = creds['SessionToken']
-    expiration = creds['Expiration']
+    def ensure_mfa_arn(self):
+            mfa = self.get_mfa_arn()
 
-    print(textwrap.dedent('''
-        Paste the following into your terminal:
+            if mfa:
+                return mfa
 
-            export AWS_ACCESS_KEY_ID="{access}"
-            export AWS_SECRET_ACCESS_KEY="{secret}"
-            export AWS_SESSION_TOKEN="{token}"
+            mfa_arn = input('What is your MFA ARN?: ')
+            set_mfa_arn(mfa_arn)
 
-        These credentials will expire at {expire}.
-    '''.format(
-            access=access_key_id,
-            secret=secret_access_key,
-            token=session_token,
-            expire=expiration
+            return mfa_arn
+
+
+    def get_session_keys(self, mfa_arn, mfa_token, duration):
+        if self.profile != 'default':
+           session = boto3.Session(profile_name=self.profile)
+        aws_client = session.client('sts')
+        return aws_client.get_session_token(
+            DurationSeconds=duration,
+            SerialNumber=mfa_arn,
+            TokenCode=mfa_token
         )
-    ))
+
+
+    def get_exports(self, keys):
+        creds = keys['Credentials']
+        access_key_id = creds['AccessKeyId']
+        secret_access_key = creds['SecretAccessKey']
+        session_token = creds['SessionToken']
+        expiration = creds['Expiration']
+
+        print(textwrap.dedent('''
+            Paste the following into your terminal:
+
+                export AWS_ACCESS_KEY_ID="{access}"
+                export AWS_SECRET_ACCESS_KEY="{secret}"
+                export AWS_SESSION_TOKEN="{token}"
+    
+            These credentials will expire at {expire}.
+        '''.format(
+                access=access_key_id,
+                secret=secret_access_key,
+                token=session_token,
+                expire=expiration
+            )
+        ))
 
 
 def main(args):
+    profile = 'default'
+    if args.get('--profile'):
+       profile = args.get('<profile>')
+    mgr = AccountManager(profile)
+
     if args.get('set-mfa-arn'):
-        set_mfa_arn(args.get('<mfa_arn>'))
-        print('Set MFA ARN to {}'.format(get_config()['mfa_arn']))
+        mgr.set_mfa_arn(args.get('<mfa_arn>'))
+        print('Set MFA ARN for {} to {}'.format(profile, mgr.get_config()['mfa_arn']))
 
     if args.get('login'):
-        mfa_arn = ensure_mfa_arn()
+        mfa_arn = mgr.ensure_mfa_arn()
         mfa_token = args.get('<mfa_token>')
         duration = int(args.get('--duration'))
 
-        keys = get_session_keys(mfa_arn, mfa_token, duration)
-        get_exports(keys)
+        keys = mgr.get_session_keys(mfa_arn, mfa_token, duration)
+        mgr.get_exports(keys)
 
 
 if __name__ == '__main__':
