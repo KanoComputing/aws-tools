@@ -1,0 +1,14 @@
+#!/usr/bin/env python
+
+"""
+An example script to test aws-policy-minimize. It tries to list a bucket.
+"""
+
+import boto3
+
+testBucket = 'sample-bucket-name'
+
+s3 = boto3.resource('s3')
+bucket = s3.Bucket(testBucket)
+objects = [x for x in bucket.objects.all()]
+
