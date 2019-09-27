@@ -5,15 +5,20 @@ A tool to manage MFA session creation, allowing the settings to be saved to a
 configuration file and providing a set of commands to run to utilise the
 created session.
 
+Can also assume a role.
+
 Usage:
-    aws-mfa [--profile <profile>] login [--duration=<time>] <mfa_token>
+    aws-mfa [--profile <profile>] login [--duration=<time>] <mfa_token> [--shell]
     aws-mfa [--profile <profile>] set-mfa-arn <mfa_arn>
+    aws-mfa [--profile <profile>] add-role <nickname> <role_arn>
+    aws-mfa [--profile <profile>] assume-role <nickname>  [--shell]
 
 Arguments:
     login                            Create an AWS session with a MFA token
     set-mfa-arn                      Configure an ARN to use as the MFA device
     --duration=<time>, -d <time>     How long to create the session for
                                      [default: 43200]
+    --shell                          Launch a shell having the correct credentials
 '''
 
 
@@ -25,7 +30,10 @@ import docopt
 import jsonschema
 import textwrap
 import yaml
+from contextlib import contextmanager
 
+#import logging
+#boto3.set_stream_logger('', logging.DEBUG)
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser('~'), '.aws-mfa-login'
@@ -40,9 +48,14 @@ CONFIG_SCHEMA = {
       'account':  {
         'type': 'object',
         'properties': {
-            'mfa_arn': {'type': 'string'}
+            'mfa_arn': {'type': 'string'},
+            'role_map': {
+                'type': 'object',
+                'additionalProperties': {'type': 'string'}
+            }
         }
-      }
+      },
+      'role_map':  { "$ref": "#/definitions/role_map" }
     },
     'type': 'object',
     'properties': {
@@ -50,13 +63,82 @@ CONFIG_SCHEMA = {
         'profiles' : {
            'type': 'object',
            'additionalProperties': { "$ref": "#/definitions/account" }
-        }
+        },
+        'role_map':  { "$ref": "#/definitions/role_map" }
    }
 }
 
+class EnvManager:
+    import pwd
+    import platform
+    import os
+    import subprocess
+
+    def __init__(self):
+        pass
+
+    def get_exports(self, keys):
+        creds = keys['Credentials']
+        access_key_id = creds['AccessKeyId']
+        secret_access_key = creds['SecretAccessKey']
+        session_token = creds['SessionToken']
+        expiration = creds['Expiration']
+
+        print(textwrap.dedent('''
+            Paste the following into your terminal:
+
+                export AWS_ACCESS_KEY_ID="{access}"
+                export AWS_SECRET_ACCESS_KEY="{secret}"
+                export AWS_SESSION_TOKEN="{token}"
+
+            These credentials will expire at {expire}.
+        '''.format(
+                access=access_key_id,
+                secret=secret_access_key,
+                token=session_token,
+                expire=expiration
+            )
+        ))
+
+    def _get_shell(self):
+        # should detect OS here and return correct shell, but for now assume bash works
+        return ['/bin/bash', '-i'], 'debian_chroot'
+
+    def start_shell(self, keys, sessionName):
+        creds = keys['Credentials']
+        access_key_id = creds['AccessKeyId']
+        secret_access_key = creds['SecretAccessKey']
+        session_token = creds['SessionToken']
+
+        env = os.environ.copy()
+
+        env['AWS_ACCESS_KEY_ID'] = access_key_id
+        env['AWS_SECRET_ACCESS_KEY'] = secret_access_key
+        env['AWS_SESSION_TOKEN'] = session_token
+
+        shellCmdArgs, promptVar = self._get_shell()
+        if promptVar in env:
+            env[promptVar] = ':'.join([env[promptVar],sessionName])
+        else:
+            env[promptVar] = sessionName
+
+        self.subprocess.run(shellCmdArgs,env=env)
+
+
 class AccountManager:
+
     def __init__(self, profile):
         self.profile = profile
+
+
+    @contextmanager
+    def persistConfig(self):
+        conf = self.get_config()
+        try:
+            yield conf
+        finally:
+            self.store_config(conf)
+
 
     def get_config(self):
         conf = None
@@ -81,16 +163,15 @@ class AccountManager:
 
 
     def set_mfa_arn(self, arn):
-        conf = self.get_config()
-        if self.profile != 'default':
-            if not 'profiles'  in conf:
-                conf['profiles'] = {}
-            if self.profile not in conf['profiles']:
-                conf['profiles'][self.profile] = {}
-            conf['profiles'][self.profile]['mfa_arn'] = arn
-        else:
-            conf['mfa_arn'] = arn
-        self.store_config(conf)
+        with self.persistConfig() as conf:
+           if self.profile != 'default':
+               if not 'profiles'  in conf:
+                   conf['profiles'] = {}
+               if self.profile not in conf['profiles']:
+                   conf['profiles'][self.profile] = {}
+               conf['profiles'][self.profile]['mfa_arn'] = arn
+           else:
+               conf['mfa_arn'] = arn
 
 
     def get_mfa_arn(self):
@@ -102,6 +183,31 @@ class AccountManager:
                 print('missing ARN for profile ', self.profile)
         return conf['mfa_arn']
 
+    def set_role_arn(self, nickname, arn):
+        with self.persistConfig() as conf:
+           if self.profile != 'default':
+               if not 'profiles'  in conf:
+                   conf['profiles'] = {}
+               if self.profile not in conf['profiles']:
+                   conf['profiles'][self.profile] = {}
+               if 'role_map' not in conf['profiles'][self.profile]:
+                   conf['profiles'][self.profile]['role_map'] = {}
+               conf['profiles'][self.profile]['role_map'][nickname] = arn
+           else:
+               conf['role_map'][nickname] = arn
+
+    def get_role_arn(self, nickname):
+        conf = self.get_config()
+        try:
+            if self.profile != 'default':
+                if self.profile in conf['profiles'] and nickname in  conf['profiles'][self.profile]['role_map']:
+                    return conf['profiles'][self.profile]['role_map'][nickname]
+                else:
+                    print('missing ARN for profile ', self.profile,' role ', nickname)
+            return conf['role_map'][nickname]
+        except:
+            return None
+
 
     def ensure_mfa_arn(self):
             mfa = self.get_mfa_arn()
@@ -110,9 +216,20 @@ class AccountManager:
                 return mfa
 
             mfa_arn = input('What is your MFA ARN?: ')
-            set_mfa_arn(mfa_arn)
+            self.set_mfa_arn(mfa_arn)
 
             return mfa_arn
+
+    def ensure_role_arn(self, nickname):
+            role = self.get_role_arn(nickname)
+
+            if role:
+                return role
+
+            role_arn = input('What is your role ARN for {}?: '.format(nickname))
+            self.set_role_arn(nickname, role_arn)
+
+            return role_arn
 
 
     def get_session_keys(self, mfa_arn, mfa_token, duration):
@@ -125,29 +242,17 @@ class AccountManager:
             TokenCode=mfa_token
         )
 
+    def get_role_keys(self, role_arn, nickname,duration):
+        if self.profile != 'default':
+           session = boto3.Session(profile_name=self.profile)
+        aws_client = session.client('sts')
+        return aws_client.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=nickname,
+            DurationSeconds=duration
+        )
 
-    def get_exports(self, keys):
-        creds = keys['Credentials']
-        access_key_id = creds['AccessKeyId']
-        secret_access_key = creds['SecretAccessKey']
-        session_token = creds['SessionToken']
-        expiration = creds['Expiration']
 
-        print(textwrap.dedent('''
-            Paste the following into your terminal:
-
-                export AWS_ACCESS_KEY_ID="{access}"
-                export AWS_SECRET_ACCESS_KEY="{secret}"
-                export AWS_SESSION_TOKEN="{token}"
-    
-            These credentials will expire at {expire}.
-        '''.format(
-                access=access_key_id,
-                secret=secret_access_key,
-                token=session_token,
-                expire=expiration
-            )
-        ))
 
 
 def main(args):
@@ -166,7 +271,26 @@ def main(args):
         duration = int(args.get('--duration'))
 
         keys = mgr.get_session_keys(mfa_arn, mfa_token, duration)
-        mgr.get_exports(keys)
+        envMgr = EnvManager()
+        if args.get('--shell'):
+            envMgr.start_shell(keys, profile)
+        else:
+            envMgr.get_exports(keys)
+
+    if args.get('add-role'):
+        mgr.set_role_arn(args.get('<nickname>'),args.get('<role_arn>'))
+
+    if args.get('assume-role'):
+        role_arn = mgr.ensure_role_arn(args.get('<nickname>'))
+
+        duration = int(args.get('--duration'))
+        nickname = args.get('<nickname>')
+        keys = mgr.get_role_keys(role_arn, nickname ,duration)
+        envMgr = EnvManager()
+        if args.get('--shell'):
+            envMgr.start_shell(keys, ':'.join([profile,nickname]))
+        else:
+            envMgr.get_exports(keys)
 
 
 if __name__ == '__main__':
