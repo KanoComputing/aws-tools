@@ -8,12 +8,14 @@ created session.
 Can also assume a role.
 
 Usage:
-    aws-mfa [--profile <profile>] login [--duration=<time>] <mfa_token> [--shell]
-    aws-mfa [--profile <profile>] set-mfa-arn <mfa_arn>
-    aws-mfa [--profile <profile>] add-role <nickname> <role_arn>
-    aws-mfa [--profile <profile>] assume-role <nickname>  [--shell]
+    aws-mfa [--profile=<profile>] login [--duration=<time>] <mfa_token> [--shell]
+    aws-mfa [--profile=<profile>] set-mfa-arn <mfa_arn>
+    aws-mfa [--profile=<profile>] add-role <nickname> <role_arn>
+    aws-mfa [--profile=<profile>] assume-role <nickname>  [--duration=<time>] [--shell]
+
 
 Arguments:
+    --profile=<profile>              Use this profile from your aws config.
     login                            Create an AWS session with a MFA token
     set-mfa-arn                      Configure an ARN to use as the MFA device
     --duration=<time>, -d <time>     How long to create the session for
@@ -39,33 +41,43 @@ CONFIG_FILE = os.path.join(
     os.path.expanduser('~'), '.aws-mfa-login'
 )
 DEFAULT_CONFIG = {
-    'mfa_arn': '',
+    'version': 2,
     'profiles': {}
 }
 
-CONFIG_SCHEMA = {
-    'definitions': {
-      'account':  {
+CONFIG_SCHEMA_VERSIONS = {
+    1: {
         'type': 'object',
         'properties': {
-            'mfa_arn': {'type': 'string'},
-            'role_map': {
-                'type': 'object',
-                'additionalProperties': {'type': 'string'}
-            }
+            'mfa_arn': {'type': 'string'}
         }
-      },
-      'role_map':  { "$ref": "#/definitions/role_map" }
     },
-    'type': 'object',
-    'properties': {
-        'mfa_arn': {'type': 'string'}, # default mfa
-        'profiles' : {
-           'type': 'object',
-           'additionalProperties': { "$ref": "#/definitions/account" }
+
+    2: {
+        'definitions': {
+            'account':  {
+                'type': 'object',
+                'properties': {
+                    'mfa_arn': {'type': 'string'},
+                    'role_map': {
+                        'type': 'object',
+                        'additionalProperties': {'type': 'string'}
+                    }
+                }
+            },
         },
-        'role_map':  { "$ref": "#/definitions/role_map" }
-   }
+        'type': 'object',
+        'properties': {
+            'version': {
+                'type' : 'integer'
+            },
+            'profiles' : {
+                'type': 'object',
+                'additionalProperties': { "$ref": "#/definitions/account" }
+            },
+        },
+        'required': ['profiles', 'version']
+    }
 }
 
 class EnvManager:
@@ -115,6 +127,7 @@ class EnvManager:
         env['AWS_ACCESS_KEY_ID'] = access_key_id
         env['AWS_SECRET_ACCESS_KEY'] = secret_access_key
         env['AWS_SESSION_TOKEN'] = session_token
+        env['AWS_SESSION_NAME'] = sessionName
 
         shellCmdArgs, promptVar = self._get_shell()
         if promptVar in env:
@@ -129,6 +142,8 @@ class AccountManager:
 
     def __init__(self, profile):
         self.profile = profile
+        self.config_version = 1
+        self.max_config_version = len(CONFIG_SCHEMA_VERSIONS)
 
 
     @contextmanager
@@ -140,6 +155,19 @@ class AccountManager:
             self.store_config(conf)
 
 
+    def migrate_config(self, conf):
+        while self.config_version < self.max_config_version:
+            if self.config_version == 1:
+                conf = {
+                    'version': 2,
+                    'profiles': {
+                        'default':
+                           conf
+                        }
+                    }
+            self.config_version +=1
+            return conf
+
     def get_config(self):
         conf = None
 
@@ -150,13 +178,19 @@ class AccountManager:
         if not conf:
             conf = DEFAULT_CONFIG
 
-        jsonschema.validate(conf, CONFIG_SCHEMA)
+        if 'version' not in conf or conf['version'] < self.max_config_version:
+            conf = self.migrate_config(conf)
+            self.store_config(conf)
+        else:
+            self.config_version = conf['version']
+
+        jsonschema.validate(conf, CONFIG_SCHEMA_VERSIONS[self.config_version])
 
         return conf
 
 
     def store_config(self, conf):
-        jsonschema.validate(conf, CONFIG_SCHEMA)
+        jsonschema.validate(conf, CONFIG_SCHEMA_VERSIONS[self.config_version])
 
         with open(CONFIG_FILE, 'w') as conf_f:
             yaml.dump(conf, conf_f)
@@ -176,35 +210,27 @@ class AccountManager:
 
     def get_mfa_arn(self):
         conf = self.get_config()
-        if self.profile != 'default':
-            if self.profile in conf['profiles']:
-                return conf['profiles'][self.profile]['mfa_arn']
-            else:
-                print('missing ARN for profile ', self.profile)
-        return conf['mfa_arn']
+        if self.profile in conf['profiles']:
+            return conf['profiles'][self.profile]['mfa_arn']
+        return None
 
     def set_role_arn(self, nickname, arn):
         with self.persistConfig() as conf:
-           if self.profile != 'default':
-               if not 'profiles'  in conf:
-                   conf['profiles'] = {}
-               if self.profile not in conf['profiles']:
-                   conf['profiles'][self.profile] = {}
-               if 'role_map' not in conf['profiles'][self.profile]:
-                   conf['profiles'][self.profile]['role_map'] = {}
-               conf['profiles'][self.profile]['role_map'][nickname] = arn
-           else:
-               conf['role_map'][nickname] = arn
+            if not 'profiles'  in conf:
+                conf['profiles'] = {}
+            if self.profile not in conf['profiles']:
+                conf['profiles'][self.profile] = {}
+            if 'role_map' not in conf['profiles'][self.profile]:
+                conf['profiles'][self.profile]['role_map'] = {}
+            conf['profiles'][self.profile]['role_map'][nickname] = arn
 
     def get_role_arn(self, nickname):
         conf = self.get_config()
         try:
-            if self.profile != 'default':
-                if self.profile in conf['profiles'] and nickname in  conf['profiles'][self.profile]['role_map']:
-                    return conf['profiles'][self.profile]['role_map'][nickname]
-                else:
-                    print('missing ARN for profile ', self.profile,' role ', nickname)
-            return conf['role_map'][nickname]
+            if self.profile in conf['profiles'] and nickname in  conf['profiles'][self.profile]['role_map']:
+                return conf['profiles'][self.profile]['role_map'][nickname]
+            else:
+                return None
         except:
             return None
 
@@ -231,10 +257,20 @@ class AccountManager:
 
             return role_arn
 
+    def get_boto_session(self):
+        profile_name = self.profile
+        if 'AWS_SESSION_NAME' in os.environ or self.profile == 'default':
+            # if we are in a sesssion started by aws-mfa, we don't want to use the
+            # credentials from ~/.aws/cfredentials, because that drops the MFA token.
+            # So don't pass in a profile, which means we use the env vars.
+            session = boto3.Session()
+        else:
+           session = boto3.Session(profile_name=profile_name)
+        return session
+
 
     def get_session_keys(self, mfa_arn, mfa_token, duration):
-        if self.profile != 'default':
-           session = boto3.Session(profile_name=self.profile)
+        session = self.get_boto_session()
         aws_client = session.client('sts')
         return aws_client.get_session_token(
             DurationSeconds=duration,
@@ -243,8 +279,7 @@ class AccountManager:
         )
 
     def get_role_keys(self, role_arn, nickname,duration):
-        if self.profile != 'default':
-           session = boto3.Session(profile_name=self.profile)
+        session = self.get_boto_session()
         aws_client = session.client('sts')
         return aws_client.assume_role(
             RoleArn=role_arn,
@@ -258,7 +293,11 @@ class AccountManager:
 def main(args):
     profile = 'default'
     if args.get('--profile'):
-       profile = args.get('<profile>')
+        profile = args.get('--profile')
+    elif 'AWS_SESSION_NAME' in os.environ:
+        # if we are in a session started by aws-mfa, use that
+        profile = os.environ['AWS_SESSION_NAME']
+
     mgr = AccountManager(profile)
 
     if args.get('set-mfa-arn'):
