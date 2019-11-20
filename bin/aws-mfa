@@ -302,7 +302,7 @@ def main(args):
 
     if args.get('set-mfa-arn'):
         mgr.set_mfa_arn(args.get('<mfa_arn>'))
-        print('Set MFA ARN for {} to {}'.format(profile, mgr.get_config()['mfa_arn']))
+        print('Set MFA ARN for {} to {}'.format(profile, mgr.get_mfa_arn()))
 
     if args.get('login'):
         mfa_arn = mgr.ensure_mfa_arn()
